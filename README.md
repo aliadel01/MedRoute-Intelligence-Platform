@@ -35,7 +35,7 @@ The platform is built on a modern data stack that separates concerns clearly: ra
 
 ## Architecture
 
-![Architecture Diagram](docs/image.png)
+![Architecture Diagram](docs/architecture.png)
 
 
 ## Data Sources
@@ -259,7 +259,7 @@ medroute-intelligence-platform/
 │       │   └── dbt_transformation_dag.py
 │       └── plugins/
 │
-├── governance/
+├── /
 │   └── openmetadata/
 │       └── metadata_ingestion.yaml
 │
