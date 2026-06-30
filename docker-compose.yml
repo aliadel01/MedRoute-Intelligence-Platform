@@ -6,6 +6,7 @@ networks:
 
 volumes:
   redpanda-data:
+  postgres-data:
 
 services:
   # --- Redpanda Broker (Kafka Alternative) ---
@@ -13,12 +14,17 @@ services:
     image: docker.redpanda.com/redpandadata/redpanda:latest
     container_name: redpanda-0
     command:
-      - redpanda start
+      - redpanda
+      - start
       - --overprovisioned
-      - --smp 1
-      - --memory 1G
-      - --reserve-memory 0M
-      - --node-id 0
+      - --smp
+      - "1"
+      - --memory
+      - "1G"
+      - --reserve-memory
+      - "0M"
+      - --node-id
+      - "0"
       - --check=false
       - --kafka-addr=plaintext://0.0.0.0:29092,external://0.0.0.0:9092
       - --advertise-kafka-addr=plaintext://redpanda-0:29092,external://localhost:9092
@@ -53,3 +59,90 @@ services:
       - streaming-net
     depends_on:
       - redpanda
+
+
+  # --- PostGIS Database ---
+  postgres:
+    image: postgis/postgis:15-3.3
+    container_name: medroute_postgres
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=medroute_pass
+      - POSTGRES_DB=medroute_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - streaming-net
+
+  # --- pgAdmin (Database Web UI) ---
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: medroute_pgadmin
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=admin@medroute.com
+      - PGADMIN_DEFAULT_PASSWORD=admin_pass
+    ports:
+      - "5050:80"
+    networks:
+      - streaming-net
+    depends_on:
+      - postgres
+
+  # --- OSRM Routing Engine ---
+  osrm:
+    image: osrm/osrm-backend:latest
+    container_name: medroute_osrm
+    # Note: Replace 'region.osrm' with your actual preprocessed .osrm filename
+    command: osrm-routed --algorithm mld /data/nyc-roads.osrm
+    volumes:
+      - ./simulator/routing/data:/data   # Maps a local folder containing your preprocessed map data
+    ports:
+      - "5000:5000"
+    networks:
+      - streaming-net
+
+  # --- Apache Spark with Interactive Jupyter Learning Environment---
+  spark:
+    image: apache/spark:3.5.1-python3
+    container_name: medroute_spark
+    user: root 
+    environment:
+      - SPARK_MASTER_URL=local[*]
+    ports:
+      - "4040:4040"   # Spark Web UI
+      - "8888:8888"   # Jupyter Notebook Web Interface
+    volumes:
+      - ./decision_engine:/opt/spark/jobs
+      - ./simulator/hospitals:/opt/spark/data
+      - ./checkpoints:/opt/spark/checkpoints
+    # This automatically installs jupyter and spins up the server when you run docker compose up
+    entrypoint: >
+      bash -c "if [ -f /opt/spark/jobs/requirements.txt ]; then pip install -r /opt/spark/jobs/requirements.txt; fi && 
+      pip install 'notebook<7' && 
+      jupyter notebook --ip=0.0.0.0 --port=8888 --no-browser --allow-root --NotebookApp.token='' --NotebookApp.password='' --notebook-dir=/opt/spark/jobs"    networks:
+    networks:
+      - streaming-net
+    depends_on:
+      - redpanda
+      - postgres
+      - osrm
+
+  dispatch-engine:
+    image: apache/spark:3.5.1-python3
+    build:
+      context: ./decision_engine
+      dockerfile: Dockerfile
+    container_name: medroute_dispatch_engine
+    user: root
+    restart: unless-stopped
+    volumes:
+      - ./decision_engine:/opt/spark/jobs
+      - ./checkpoints:/opt/spark/checkpoints
+    networks:
+      - streaming-net
+    depends_on:
+      - redpanda
+      - postgres
+      - osrm
