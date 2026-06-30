@@ -1,3 +1,13 @@
+"""
+    The source data doesn't have ICU beds information, so we need to calculate it based on the total number of beds in each hospital. 
+    The rules for calculating ICU beds are as follows:
+        - if total_beds < 100, then ICU beds = 5% of total beds.
+        - if 100 <= total_beds < 500, then ICU beds = 10% of total beds.
+        - if total_beds >= 500, then ICU beds = 15% of total beds.
+"""
+
+
+
 import pandas as pd
 import numpy as np
 
