@@ -1,89 +1,117 @@
 # ════════════════════════════════════════════════════════════════
 # MedRoute Dispatch Engine — Spark Structured Streaming Pipeline
 # ════════════════════════════════════════════════════════════════
+# Flow:
+#   incident_stream (Kafka)
+#   → parse JSON
+#   → mapInPandas: PostGIS + OSRM table + severity selection + OSRM route
+#   → foreachBatch → [Kafka: dispatched_routes] + [Kafka: DLQ] + [Postgres]
+# ════════════════════════════════════════════════════════════════
 
-import requests
-import psycopg2
-from psycopg2 import pool
 import logging
-import sys
 import os
+import sys
+
 import pandas as pd
+import psycopg2
+import psycopg2.pool
+import requests
 
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, from_json, to_json, struct, current_timestamp, lit
+from pyspark.sql.functions import col, current_timestamp, from_json, lit, struct, to_json
 from pyspark.sql.types import (
-    StructType, StructField,
-    StringType, DoubleType, IntegerType, TimestampType,
-    ArrayType,
+    ArrayType, DoubleType, IntegerType, StringType,
+    StructField, StructType, TimestampType,
 )
 
+
 # ────────────────────────────────────────────────────────────────
-# Logging Configuration
+# Logging
 # ────────────────────────────────────────────────────────────────
 
 LOG_FILE_PATH = "medroute_engine.log"
-log_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
-file_handler = logging.FileHandler(LOG_FILE_PATH, mode="a", encoding="utf-8")
-file_handler.setFormatter(log_formatter)
+_formatter       = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+_file_handler    = logging.FileHandler(LOG_FILE_PATH, mode="a", encoding="utf-8")
+_console_handler = logging.StreamHandler(sys.stdout)
+_file_handler.setFormatter(_formatter)
+_console_handler.setFormatter(_formatter)
 
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setFormatter(log_formatter)
+logging.getLogger().setLevel(logging.INFO)
+logging.getLogger().addHandler(_file_handler)
+logging.getLogger().addHandler(_console_handler)
 
-root_logger = logging.getLogger()
-root_logger.setLevel(logging.INFO)
-root_logger.addHandler(file_handler)
-root_logger.addHandler(console_handler)
+# Module-level loggers — defined once, never recreated per row
+logger          = logging.getLogger("MedRoute.DispatchEngine")
+_pg_log         = logging.getLogger("MedRoute.Worker.PostGIS")
+_osrm_t_log     = logging.getLogger("MedRoute.Worker.OSRM.Table")
+_osrm_r_log     = logging.getLogger("MedRoute.Worker.OSRM.Route")
+_engine_log     = logging.getLogger("MedRoute.Worker.DecisionEngine")
+_sink_log       = logging.getLogger("MedRoute.Worker.Sink")
 
-logger = logging.getLogger("MedRoute.DispatchEngine")
-logger.info(f"Logging initialized. Saved to: {os.path.abspath(LOG_FILE_PATH)}")
+logger.info("Logging initialised — file: %s", os.path.abspath(LOG_FILE_PATH))
 
-# [PERFORMANCE FIX] Define Loggers outside UDFs to avoid recreation overhead per row
-_postgis_logger = logging.getLogger("MedRoute.Worker.PostGIS")
-_osrm_table_logger = logging.getLogger("MedRoute.Worker.OSRM-Table")
-_engine_logger = logging.getLogger("MedRoute.Worker.DecisionEngine")
-_router_logger = logging.getLogger("MedRoute.Worker.OSRM-Router")
 
 # ────────────────────────────────────────────────────────────────
 # Configuration
 # ────────────────────────────────────────────────────────────────
 
-KAFKA_BOOTSTRAP_SERVERS = "redpanda-0:29092"
-KAFKA_INPUT_TOPIC       = "incident_stream"
-KAFKA_OUTPUT_TOPIC      = "dispatched_routes"
-KAFKA_CHECKPOINT_PATH   = "/opt/spark/checkpoints/dispatched_routes"
+KAFKA_BOOTSTRAP  = "redpanda-0:29092"
+KAFKA_IN_TOPIC   = "incident_stream"
+KAFKA_OUT_TOPIC  = "dispatched_routes"
+KAFKA_DLQ_TOPIC  = "dispatched_routes_dlq"
+CHECKPOINT_PATH  = "/opt/spark/checkpoints/dispatched_routes"
 
 POSTGRES_CONFIG = {
-    "user":     "admin",
-    "password": "12345678",
-    "host":     "med_postgres",
+    "user":     "postgres",
+    "password": "medroute_pass",
+    "host":     "medroute_postgres",
     "port":     "5432",
     "database": "medroute_db",
 }
 
-OSRM_URL = "http://osrm:5000/table/v1/driving"
-OSRM_TIMEOUT_SEC = 3
-SEARCH_RADIUS_METERS = 10_000   # 10km candidate search radius
+JDBC_URL = (
+    f"jdbc:postgresql://{POSTGRES_CONFIG['host']}:{POSTGRES_CONFIG['port']}"
+    f"/{POSTGRES_CONFIG['database']}"
+)
+JDBC_PROPS = {
+    "user":     POSTGRES_CONFIG["user"],
+    "password": POSTGRES_CONFIG["password"],
+    "driver":   "org.postgresql.Driver",
+}
+PG_TABLE = "dispatched_routes"
 
-REQUIRED_BEDS_BY_SEVERITY = {1: 1, 2: 3, 3: 5, 4: 10}
+OSRM_TABLE_URL   = "http://osrm:5000/table/v1/driving"
+OSRM_ROUTE_URL   = "http://osrm:5000/route/v1/driving"
+OSRM_TIMEOUT_SEC = 3
+
+SEARCH_RADIUS_METERS = 30_000   # 30 km
+
+# Minimum ICU beds required per severity level
+REQUIRED_BEDS = {1: 1, 2: 3, 3: 5, 4: 10}
+
 
 # ────────────────────────────────────────────────────────────────
 # Spark session
 # ────────────────────────────────────────────────────────────────
 
-logger.info("Initializing SparkSession with Kafka and PostgreSQL packages...")
+logger.info("Initialising SparkSession...")
 
-spark = ( SparkSession.builder \
-    .appName("MedRoute.DispatchEngine") \
-    .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1") \
-    .config("spark.driver.extraClassPath", "/root/.ivy2/jars/*") \
-    .config("spark.executor.extraClassPath", "/root/.ivy2/jars/*") \
+spark = (
+    SparkSession.builder
+    .appName("MedRoute.DispatchEngine")
+    .config(
+        "spark.jars.packages",
+        "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,"
+        "org.postgresql:postgresql:42.7.1",
+    )
+    .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+    .config("spark.sql.shuffle.partitions", "4")
     .getOrCreate()
 )
+spark.sparkContext.setLogLevel("WARN")
+logger.info("SparkSession ready.")
 
-spark.sparkContext.setLogLevel("WARN")    
-logger.info("SparkSession created successfully.")
 
 # ────────────────────────────────────────────────────────────────
 # Schemas
@@ -98,281 +126,347 @@ incident_schema = StructType([
     StructField("Description", StringType(),    nullable=False),
 ])
 
+output_schema = StructType([
+    StructField("incident_id",           StringType(),    True),
+    StructField("severity",              IntegerType(),   True),
+    StructField("incident_start_time",   TimestampType(), True),
+    StructField("incident_lat",          DoubleType(),    True),
+    StructField("incident_lon",          DoubleType(),    True),
+    StructField("incident_description",  StringType(),    True),
+    StructField("kafka_timestamp",       TimestampType(), True),
+    StructField("target_hospital_name",  StringType(),    True),
+    StructField("target_hospital_lat",   DoubleType(),    True),
+    StructField("target_hospital_lon",   DoubleType(),    True),
+    StructField("available_icu_beds",    IntegerType(),   True),
+    StructField("travel_duration_seconds", DoubleType(), True),
+    StructField("travel_distance_meters",  DoubleType(), True),
+    StructField("route_geometry",        StringType(),    True),
+])
+
+
 # ────────────────────────────────────────────────────────────────
-# Connection Pools Lazy Initialization
+# Lazy singletons — created once per Python worker process
 # ────────────────────────────────────────────────────────────────
 
-_db_pool = None  
-_osrm_session = None  
+_db_pool      = None
+_osrm_session = None
 
-def _get_db_pool():
+
+def _get_db_pool() -> psycopg2.pool.ThreadedConnectionPool:
+    """ThreadedConnectionPool — safe for Spark local[*] multi-threading."""
     global _db_pool
     if _db_pool is None:
-        try:
-            _db_pool = psycopg2.pool.ThreadedConnectionPool(
-                minconn=2, maxconn=10, **POSTGRES_CONFIG
-            )
-            logging.getLogger("MedRoute.Worker.PostgreSQL").info("Database ThreadedConnectionPool initialized.")
-        except Exception as e:
-            logging.getLogger("MedRoute.Worker.PostgreSQL").error(f"Failed to initialize PostGIS DB pool: {str(e)}")
-            raise e
+        _db_pool = psycopg2.pool.ThreadedConnectionPool(
+            minconn=2, maxconn=10, **POSTGRES_CONFIG
+        )
+        _pg_log.info("ThreadedConnectionPool initialised.")
     return _db_pool
 
-def _get_osrm_session():
+
+def _get_osrm_session() -> requests.Session:
+    """Persistent HTTP session — reuses TCP connections across OSRM calls."""
     global _osrm_session
     if _osrm_session is None:
-        try:
-            _osrm_session = requests.Session()
-            _osrm_session.headers.update({"Connection": "keep-alive"})
-            logging.getLogger("MedRoute.Worker.OSRM").info("OSRM session initialized.")
-        except Exception as e:
-            logging.getLogger("MedRoute.Worker.OSRM").error(f"Failed to initialize OSRM session: {str(e)}")
-            raise e
+        _osrm_session = requests.Session()
+        _osrm_session.headers.update({"Connection": "keep-alive"})
+        _osrm_t_log.info("OSRM HTTP session initialised.")
     return _osrm_session
 
+
 # ────────────────────────────────────────────────────────────────
-# Vectorized Batch Execution (Replaces 4 Heavy Python UDFs)
+# Step helpers — called per incident inside mapInPandas
 # ────────────────────────────────────────────────────────────────
 
-def process_gps_batch_vectorized(pdf: pd.DataFrame) -> pd.DataFrame:
+def _query_nearest_hospitals(db_pool, lon: float, lat: float) -> list[dict]:
     """
-    Processes the entire micro-batch as a unified Pandas DataFrame.
-    This executes within the Python Worker, eliminating row-by-row JVM serialization overhead.
+    PostGIS spatial query — returns up to 5 nearest hospitals.
+    Uses ST_DWithin for filtering and <-> KNN operator for ordering
+    so distance is computed only once against the spatial index.
+    """
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT name, latitude, longitude, COALESCE(icu_beds, 0)
+                FROM hospitals
+                WHERE ST_DWithin(
+                    geom,
+                    ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography,
+                    %s
+                )
+                ORDER BY geom <-> ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography
+                LIMIT 5;
+                """,
+                (lon, lat, SEARCH_RADIUS_METERS, lon, lat),
+            )
+            return [
+                {"name": r[0], "lat": float(r[1]), "lon": float(r[2]), "icu_beds": int(r[3])}
+                for r in cur.fetchall()         
+            ]
+    except Exception:
+        _pg_log.error("PostGIS query failed.", exc_info=True)
+        return []
+    finally:
+        if conn:
+            db_pool.putconn(conn)
+
+
+def _enrich_with_osrm_table(session, inc_lon, inc_lat, hospitals: list[dict]) -> list[dict]:
+    """
+    Single OSRM table request → attaches duration_sec and distance_meters
+    to each hospital dict in-place. Returns the enriched list.
+    """
+    coords = [f"{inc_lon},{inc_lat}"] + [f"{h['lon']},{h['lat']}" for h in hospitals]
+    params = {
+        "sources":      "0",
+        "destinations": ";".join(str(i) for i in range(1, len(hospitals) + 1)),
+        "annotations":  "duration,distance",
+    }
+    try:
+        resp = session.get(
+            f"{OSRM_TABLE_URL}/{';'.join(coords)}",
+            params=params,
+            timeout=OSRM_TIMEOUT_SEC,
+        )
+        if resp.status_code == 200:
+            data      = resp.json()
+            durations = data["durations"][0]
+            distances = data["distances"][0]
+            for i, h in enumerate(hospitals):
+                h["duration_sec"]    = float(durations[i]) if durations[i] is not None else -1.0
+                h["distance_meters"] = float(distances[i]) if distances[i] is not None else -1.0
+            return hospitals
+        _osrm_t_log.error("OSRM table HTTP %d.", resp.status_code)
+    except Exception:
+        _osrm_t_log.error("OSRM table request failed.", exc_info=True)
+
+    # Fallback — sentinel values so selection still runs
+    for h in hospitals:
+        h.setdefault("duration_sec",    -1.0)
+        h.setdefault("distance_meters", -1.0)
+    return hospitals
+
+
+def _select_best_hospital(severity: int, hospitals: list[dict]) -> dict | None:
+    """
+    Sort by travel duration ascending (sentinels last), then return the
+    fastest hospital that meets the ICU bed requirement for this severity.
+    Falls back to the closest if none qualify.
+    """
+    if not hospitals:
+        return None
+
+    sorted_h      = sorted(hospitals, key=lambda h: h["duration_sec"] if h["duration_sec"] >= 0 else float("inf"))
+    required_beds = REQUIRED_BEDS.get(severity, 1)
+
+    for h in sorted_h:
+        if h["icu_beds"] >= required_beds:
+            _engine_log.info(
+                "Selected '%s' — beds: %d, ETA: %.0fs (severity %d, needs %d beds).",
+                h["name"], h["icu_beds"], h["duration_sec"], severity, required_beds,
+            )
+            return h
+
+    _engine_log.warning(
+        "No hospital met %d-bed requirement (severity %d). Fallback: '%s'.",
+        required_beds, severity, sorted_h[0]["name"],
+    )
+    return sorted_h[0]
+
+
+def _fetch_route_geometry(session, inc_lon, inc_lat, hospital: dict) -> str:
+    """
+    OSRM route endpoint for the single selected hospital.
+    Returns a GeoJSON geometry string (LineString) for Grafana.
+    """
+    params = {"overview": "full", "geometries": "geojson"}
+    try:
+        resp = session.get(
+            f"{OSRM_ROUTE_URL}/{inc_lon},{inc_lat};{hospital['lon']},{hospital['lat']}",
+            params=params,
+            timeout=OSRM_TIMEOUT_SEC,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("routes"):
+                return str(data["routes"][0]["geometry"])
+        _osrm_r_log.error("OSRM route HTTP %d.", resp.status_code)
+    except Exception:
+        _osrm_r_log.error("OSRM route request failed.", exc_info=True)
+    return "Route Not Found"
+
+
+# ────────────────────────────────────────────────────────────────
+# mapInPandas batch processor
+# ────────────────────────────────────────────────────────────────
+
+def process_batch(pdf: pd.DataFrame) -> pd.DataFrame:
+    """
+    Called by Spark once per partition per micro-batch.
+    Initialises shared resources once, then processes every incident
+    in the partition sequentially inside Python — avoiding per-row
+    JVM ↔ Python serialisation overhead of chained UDFs.
     """
     if pdf.empty:
-        return pdf
+        return pd.DataFrame(columns=[f.name for f in output_schema.fields])
 
-    results = []
-    
-    # Initialize shared connection pools once for the entire batch
     db_pool = _get_db_pool()
     session = _get_osrm_session()
+    results = []
 
-    # Iterate through the rows efficiently inside Python context
     for _, row in pdf.iterrows():
-        lat, lon, severity = row['Start_Lat'], row['Start_Lng'], row['Severity']
-        
-        # 1. Spatial Processing (PostGIS Lookup)
-        nearest_hospitals = []
-        if lat is not None and lon is not None:
-            conn = None
-            try:
-                conn = db_pool.getconn()
-                with conn.cursor() as cursor:
-                    cursor.execute(
-                        """
-                        SELECT name, latitude, longitude, COALESCE(icu_beds, 0)
-                        FROM hospitals
-                        WHERE ST_DWithin(geom, ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography, %s)
-                        ORDER BY geom <-> ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography LIMIT 5;
-                        """, (lon, lat, SEARCH_RADIUS_METERS, lon, lat)
-                    )
-                    nearest_hospitals = [
-                        {"name": row[0], "lat": float(row[1]), "lon": float(row[2]), "icu_beds": int(row[3])}
-                        for row in cursor.fetchall()
-                    ]
-            except Exception:
-                _postgis_logger.error("PostGIS error inside optimized batch", exc_info=True)
-            finally:
-                if conn: 
-                    db_pool.putconn(conn)
+        lat      = row["Start_Lat"]
+        lon      = row["Start_Lng"]
+        severity = int(row["Severity"])
 
-        # 2 & 3. Network Routing & Decision Match Engine
-        best_hospital = None
-        if nearest_hospitals:
-            coordinates = [f"{lon},{lat}"] + [f"{h['lon']},{h['lat']}" for h in nearest_hospitals]
-            coordinates_path = ";".join(coordinates)
-            dest_indices = ";".join(str(i) for i in range(1, len(nearest_hospitals) + 1))
-            params = {"sources": "0", "destinations": dest_indices, "annotations": "duration,distance"}
-            
-            try:
-                response = session.get(f"{OSRM_URL}/{coordinates_path}", params=params, timeout=OSRM_TIMEOUT_SEC)
-                if response.status_code == 200:
-                    data = response.json()
-                    durations = data["durations"][0]
-                    distances = data["distances"][0]
-                    
-                    for idx, h in enumerate(nearest_hospitals):
-                        h["duration_sec"] = float(durations[idx]) if durations[idx] is not None else -1.0
-                        h["distance_meters"] = float(distances[idx]) if distances[idx] is not None else -1.0
-                    
-                    # Sort candidates by travel duration time
-                    sorted_hospitals = sorted(nearest_hospitals, key=lambda x: x["duration_sec"] if x["duration_sec"] >= 0 else float("inf"))
-                    required_beds = REQUIRED_BEDS_BY_SEVERITY.get(severity, 1)
-                    
-                    # Match candidate against ICU capacity requirement
-                    for h in sorted_hospitals:
-                        if h["icu_beds"] >= required_beds:
-                            best_hospital = h
-                            break
-                    if not best_hospital and sorted_hospitals:
-                        best_hospital = sorted_hospitals[0]
-            except Exception:
-                _osrm_table_logger.error("OSRM matrix call error inside optimized batch", exc_info=True)
+        # 1 — PostGIS: nearest hospitals
+        hospitals = _query_nearest_hospitals(db_pool, lon, lat)
 
-        # 4. Geometry Generation (OSRM Router)
-        route_geometry = "Route Not Found"
-        if best_hospital:
-            route_url = f"http://osrm:5000/route/v1/driving/{lon},{lat};{best_hospital['lon']},{best_hospital['lat']}"
-            try:
-                response = session.get(route_url, params={"overview": "full", "geometries": "geojson"}, timeout=2)
-                if response.status_code == 200:
-                    data = response.json()
-                    if data.get("routes"):
-                        route_geometry = str(data["routes"][0]["geometry"])
-            except Exception:
-                _router_logger.error("OSRM Routing error inside optimized batch", exc_info=True)
+        # 2 — OSRM table: travel time + distance for all candidates at once
+        if hospitals:
+            hospitals = _enrich_with_osrm_table(session, lon, lat, hospitals)
 
-        # Append structured record matching final flattened layout
+        # 3 — Decision: best hospital by severity + travel time
+        best = _select_best_hospital(severity, hospitals)
+
+        # 4 — OSRM route: road-level geometry for Grafana map
+        route_geometry = _fetch_route_geometry(session, lon, lat, best) if best else "Route Not Found"
+
         results.append({
-            "incident_id": row["ID"],
-            "severity": severity,
-            "incident_start_time": row["Start_Time"],
-            "incident_lat": lat,
-            "incident_lon": lon,
-            "incident_description": row["Description"],
-            "kafka_timestamp": row["timestamp"],
-            "target_hospital_name": best_hospital["name"] if best_hospital else None,
-            "target_hospital_lat": best_hospital["lat"] if best_hospital else None,
-            "target_hospital_lon": best_hospital["lon"] if best_hospital else None,
-            "available_icu_beds": best_hospital["icu_beds"] if best_hospital else None,
-            "travel_duration_seconds": best_hospital["duration_sec"] if best_hospital else None,
-            "travel_distance_meters": best_hospital["distance_meters"] if best_hospital else None,
-            "route_geometry": route_geometry
+            "incident_id":           row["ID"],
+            "severity":              severity,
+            "incident_start_time":   row["Start_Time"],
+            "incident_lat":          lat,
+            "incident_lon":          lon,
+            "incident_description":  row["Description"],
+            "kafka_timestamp":       row["timestamp"],
+            "target_hospital_name":  best["name"]            if best else None,
+            "target_hospital_lat":   best["lat"]             if best else None,
+            "target_hospital_lon":   best["lon"]             if best else None,
+            "available_icu_beds":    best["icu_beds"]        if best else None,
+            "travel_duration_seconds": best["duration_sec"]  if best else None,
+            "travel_distance_meters":  best["distance_meters"] if best else None,
+            "route_geometry":        route_geometry,
         })
 
     return pd.DataFrame(results)
 
-# ────────────────────────────────────────────────────────────────
-# Output Schema Definition for mapInPandas Execution
-# ────────────────────────────────────────────────────────────────
-output_schema = StructType([
-    StructField("incident_id", StringType(), True),
-    StructField("severity", IntegerType(), True),
-    StructField("incident_start_time", TimestampType(), True),
-    StructField("incident_lat", DoubleType(), True),
-    StructField("incident_lon", DoubleType(), True),
-    StructField("incident_description", StringType(), True),
-    StructField("kafka_timestamp", TimestampType(), True),
-    StructField("target_hospital_name", StringType(), True),
-    StructField("target_hospital_lat", DoubleType(), True),
-    StructField("target_hospital_lon", DoubleType(), True),
-    StructField("available_icu_beds", IntegerType(), True),
-    StructField("travel_duration_seconds", DoubleType(), True),
-    StructField("travel_distance_meters", DoubleType(), True),
-    StructField("route_geometry", StringType(), True),
-])
 
 # ────────────────────────────────────────────────────────────────
-# Pipeline Ingestion & Enrichment (Upstream)
+# Streaming pipeline — read and transform
 # ────────────────────────────────────────────────────────────────
+
+logger.info("Subscribing to '%s' at %s.", KAFKA_IN_TOPIC, KAFKA_BOOTSTRAP)
 
 raw_stream = (
     spark.readStream
     .format("kafka")
-    .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS)
-    .option("subscribe", KAFKA_INPUT_TOPIC)
-    .option("startingOffsets", "latest")
+    .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
+    .option("subscribe",            KAFKA_IN_TOPIC)
+    .option("startingOffsets",      "latest")
     .option("maxOffsetsPerTrigger", 100)
-    .option("failOnDataLoss", "false")
+    .option("failOnDataLoss",       "false")   # NOTE: set to true in production
     .load()
 )
 
 parsed_stream = (
     raw_stream
-    .withColumn("value_str", col("value").cast("string"))
+    .withColumn("value_str",     col("value").cast("string"))
     .withColumn("incident_data", from_json(col("value_str"), incident_schema))
     .select("incident_data.*", "timestamp")
 )
 
-# Convert micro-batch to Pandas vectors to avoid multi-UDF overhead
-final_df = parsed_stream.mapInPandas(process_gps_batch_vectorized, schema=output_schema)
+final_df = parsed_stream.mapInPandas(process_batch, schema=output_schema)
+
 
 # ────────────────────────────────────────────────────────────────
-# Unified Multi-Sink Configuration (`foreachBatch`)
+# foreachBatch — three sinks: Postgres + Kafka main + Kafka DLQ
 # ────────────────────────────────────────────────────────────────
 
-JDBC_URL = f"jdbc:postgresql://{POSTGRES_CONFIG['host']}:{POSTGRES_CONFIG['port']}/{POSTGRES_CONFIG['database']}"
-DB_PROPERTIES = {
-    "user": POSTGRES_CONFIG["user"],
-    "password": POSTGRES_CONFIG["password"],
-    "driver": "org.postgresql.Driver"
-}
-DB_TABLE_NAME = "dispatched_routes"
+def write_to_sinks(batch_df, batch_id):
+    """
+    Called by Spark on every micro-batch.
 
+    Valid records  → Postgres dispatched_routes table
+                   → Kafka dispatched_routes topic
+    Failed records → Kafka dispatched_routes_dlq topic
 
-def write_to_sinks_foreach_batch(batch_df, batch_id):
+    batch_df is cached before the first write so Spark does not
+    re-execute mapInPandas (PostGIS + OSRM calls) for each sink.
+    """
     if batch_df.isEmpty():
+        _sink_log.info("Batch %d empty — skipping.", batch_id)
         return
 
-    # Cache the batch DataFrame since it will be used for multiple filtering operations
     batch_df.persist()
 
-    # 1. Separate valid records from failed ones (DLQ)
-    # An incident is considered failed if no target hospital was found (target_hospital_name is NULL)
-    valid_df = batch_df.filter(col("target_hospital_name").isNotNull())
-    dlq_df = batch_df.filter(col("target_hospital_name").isNull())
-
-    total_records = batch_df.count()
-    valid_count = valid_df.count()
-    dlq_count = total_records - valid_count
-
     try:
-        # ---- First: Process Valid Records (PostgreSQL + Main Kafka Topic) ----
-        if valid_count > 0:
-            logger.info(f"Batch {batch_id}: Writing {valid_count} valid records to PostgreSQL.")
+        valid_df = batch_df.filter(col("target_hospital_name").isNotNull())
+        dlq_df   = batch_df.filter(col("target_hospital_name").isNull())
+
+        # ── Sink 1 & 2: valid records ─────────────────────────────
+        if not valid_df.isEmpty():
+            # Postgres
             valid_df.write \
                 .mode("append") \
-                .jdbc(url=JDBC_URL, table="dispatched_routes", properties=DB_PROPERTIES)
+                .jdbc(url=JDBC_URL, table=PG_TABLE, properties=JDBC_PROPS)
+            _sink_log.info("Batch %d → Postgres '%s' ✓", batch_id, PG_TABLE)
 
-            logger.info(f"Batch {batch_id}: Streaming valid records to Main Kafka Topic.")
-            kafka_main_payload = valid_df.select(
-                col("incident_id").cast("string").alias("key"),
-                to_json(struct("*")).alias("value")
+            # Kafka main topic
+            (
+                valid_df
+                .select(
+                    col("incident_id").cast("string").alias("key"),
+                    to_json(struct("*")).alias("value"),
+                )
+                .write
+                .format("kafka")
+                .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
+                .option("topic", KAFKA_OUT_TOPIC)
+                .save()
             )
-            
-            kafka_main_payload.write \
-                .format("kafka") \
-                .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS) \
-                .option("topic", "dispatched_routes") \
-                .save()
+            _sink_log.info("Batch %d → Kafka '%s' ✓", batch_id, KAFKA_OUT_TOPIC)
 
-        # ---- Second: Process Failed Records (Route to DLQ Kafka Topic) ----
-        if dlq_count > 0:
-            logger.warning(f"Batch {batch_id}: {dlq_count} records failed. Routing to DLQ Topic...")
-            
-            # Enrich failed records with error context and processing timestamp for future auditing
-            dlq_payload = dlq_df.withColumn("dlq_reason", lit("No target hospital found / NOT NULL constraint violation")) \
-                                .withColumn("dlq_timestamp", current_timestamp()) \
-                                .select(
-                                    col("incident_id").cast("string").alias("key"),
-                                    to_json(struct("*")).alias("value")
-                                )
-            
-            dlq_payload.write \
-                .format("kafka") \
-                .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS) \
-                .option("topic", "dispatched_routes_dlq") \
+        # ── Sink 3: failed records → DLQ ─────────────────────────
+        if not dlq_df.isEmpty():
+            (
+                dlq_df
+                .withColumn("dlq_reason",    lit("No hospital found within search radius"))
+                .withColumn("dlq_timestamp", current_timestamp())
+                .select(
+                    col("incident_id").cast("string").alias("key"),
+                    to_json(struct("*")).alias("value"),
+                )
+                .write
+                .format("kafka")
+                .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
+                .option("topic", KAFKA_DLQ_TOPIC)
                 .save()
+            )
+            _sink_log.warning("Batch %d → DLQ '%s' (%d failed) ✓",
+                              batch_id, KAFKA_DLQ_TOPIC, dlq_df.count())
 
-    except Exception as e:
-        logger.error(f"Critical error in micro-batch {batch_id}: {str(e)}")
+    except Exception as exc:
+        _sink_log.error("Batch %d sink error: %s", batch_id, exc, exc_info=True)
     finally:
-        # Always unpersist to release memory cluster-wide and prevent leaks
         batch_df.unpersist()
 
 
 # ────────────────────────────────────────────────────────────────
-# Execution Initialization
+# Start
 # ────────────────────────────────────────────────────────────────
-logger.info("Initializing multi-sink streaming query (Kafka & PostgreSQL)...")
+
+logger.info("Starting dispatch query — checkpoint: %s", CHECKPOINT_PATH)
 
 dispatch_query = (
     final_df.writeStream
-    .foreachBatch(write_to_sinks_foreach_batch)
-    .option("checkpointLocation", KAFKA_CHECKPOINT_PATH)
+    .foreachBatch(write_to_sinks)
+    .option("checkpointLocation", CHECKPOINT_PATH)
+    .trigger(processingTime="2 seconds")
     .start()
 )
 
-logger.info("MedRoute Emergency Dispatch Streaming Engine is live and actively processing...")
+logger.info("MedRoute Dispatch Engine is live.")
 dispatch_query.awaitTermination()
