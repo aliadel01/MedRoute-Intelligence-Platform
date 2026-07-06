@@ -1,0 +1,34 @@
+{
+  "name": "medroute-hifld-connector",
+  "config": {
+
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+
+    "database.hostname": "medroute_postgres",
+    "database.port":     "5432",
+    "database.user":     "debezium_user",
+    "database.password": "debezium_pass",
+    "database.dbname":   "medroute_db",
+
+    "topic.prefix": "medroute",
+
+    "table.include.list": "public.hospitals",
+
+    "slot.name": "medroute_hifld_slot_v2",
+
+    "publication.name": "medroute_hifld_pub",
+    "publication.autocreate.mode": "disabled",  
+
+    "snapshot.mode": "initial",
+
+    "decimal.handling.mode": "double",
+
+    "timestamp.mode": "adaptive_time_microseconds",
+
+    "heartbeat.interval.ms": "30000",
+      
+    "provide.transaction.metadata": "false",
+
+    "plugin.name": "pgoutput"
+  }
+}
