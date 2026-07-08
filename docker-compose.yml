@@ -1,4 +1,3 @@
-
 networks:
   streaming-net:
     driver: bridge
@@ -51,6 +50,8 @@ services:
     depends_on:
       - redpanda
 
+
+  # --- Debezium Kafka Connect ---
   kafka-connect:
     image: debezium/connect:2.7.0.Final 
     container_name: medroute_debezium
@@ -76,13 +77,14 @@ services:
       - streaming-net
     depends_on:
       - redpanda
+      - console
       - postgres
 
 
   # --- Python Incident Simulator ---
   python-incident-simulator:
     build:
-      context: ./simulator/incident-simulator
+      context: ./src/simulators/incident
       dockerfile: Dockerfile
     container_name: python-simulator
     command: python incident_simulator.py
@@ -130,10 +132,12 @@ services:
   osrm:
     image: osrm/osrm-backend:latest
     container_name: medroute_osrm
-    # Note: Replace 'region.osrm' with your actual preprocessed .osrm filename
-    command: osrm-routed --algorithm mld /data/nyc-roads.osrm
+    command: >
+      bash -c "bash /app/traffic_updater.sh & 
+      exec osrm-routed --algorithm mld /data/nyc-roads.osrm"
     volumes:
-      - ./simulator/routing/data:/data   # Maps a local folder containing your preprocessed map data
+      - ./data/osrm:/data
+      - ./src/simulators/routing/traffic_updater.sh:/app/traffic_updater.sh
     ports:
       - "5000:5000"
     networks:
@@ -150,27 +154,46 @@ services:
       - streaming-net
     depends_on:
       - redpanda 
-    environment:
-    - GF_SECURITY_ADMIN_PASSWORD=admin 
+    environment: 
+      - GF_SECURITY_ADMIN_PASSWORD=admin 
     volumes:
-    - grafana-data:/var/lib/grafana
+      - grafana-data:/var/lib/grafana
 
   # --- Apache Spark ---
   dispatch-engine:
     image: apache/spark:3.5.1-python3
     build:
-      context: ./decision_engine
+      context: ./src/decision_engine
       dockerfile: Dockerfile
     container_name: medroute_dispatch_engine
     user: root
     restart: unless-stopped
     volumes:
-      - ./decision_engine:/opt/spark/jobs
-      - ./checkpoints:/opt/spark/checkpoints
-      - ./decision_engine/medroute_engine.log:/app/medroute_engine.log
+      - ./src/decision_engine:/opt/spark/jobs
+      - ./src/decision_engine/checkpoints:/opt/spark/checkpoints
     networks:
       - streaming-net
     depends_on:
       - redpanda
+      - console
       - postgres
+      - pgadmin
       - osrm
+      - python-incident-simulator
+
+  # --- Traffic Fetcher ---
+  traffic_fetcher:
+    build:
+      context: ./src/simulators/routing
+      dockerfile: Dockerfile.traffic
+    volumes:
+      - ./data/osrm:/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    depends_on:
+      - osrm
+    networks:
+      - streaming-net

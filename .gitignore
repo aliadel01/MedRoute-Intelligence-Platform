@@ -1,3 +1,4 @@
-simulator/routing/data/
+data/
 resources/
-decision_engine/medroute_engine.log
+src/decision_engine/medroute_engine.log
+src/decision_engine/checkpoints/

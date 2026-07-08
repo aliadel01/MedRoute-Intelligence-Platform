@@ -3,7 +3,7 @@ import csv
 import time
 
 # Configurations - Using SODA2 public endpoint based on your exact dataset id
-NYC_API_URL = "https://data.cityofnewyork.us/resource/i4gi-tjb9.json?$limit=150000"
+NYC_API_URL = "https://data.cityofnewyork.us/resource/i4gi-tjb9.json?$limit=400000"
 OSRM_NEAREST_URL = "http://localhost:5000/nearest/v1/driving/"
 OUTPUT_CSV_FILE = "nyc_to_osm_mapping.csv"
 
