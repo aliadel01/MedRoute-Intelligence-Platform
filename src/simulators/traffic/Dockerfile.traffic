@@ -1,0 +1,27 @@
+# Use a slim Python base image to keep the container lightweight
+FROM python:3.11-slim
+
+# Set environment variables to optimize Python behavior inside Docker
+# PYTHONDONTWRITEBYTECODE: Prevents Python from writing .pyc files to disk
+# PYTHONUNBUFFERED: Forces stdout and stderr streams to be unbuffered for real-time logs
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
+
+WORKDIR /app
+
+# Install system dependencies (curl is useful for healthchecks/debugging)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy only the requirements first to leverage Docker layer caching
+# (Create a requirements.txt if you haven't, or we can install requests directly)
+RUN pip install --no-cache-dir requests
+
+# Copy the script into the container matching your project structure
+# This assumes the Dockerfile context is at the root or src/simulators/traffic/
+COPY fetch_and_build.py /app/fetch_and_build.py
+
+# Run the script when the container starts
+CMD ["python", "/app/fetch_and_build.py"]

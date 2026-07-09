@@ -143,6 +143,53 @@ services:
     volumes:
       - grafana-data:/var/lib/grafana
 
+  # --- Valhalla Routing Engine ---
+  valhalla:
+    image: ghcr.io/gis-ops/docker-valhalla/valhalla:latest
+    container_name: medroute_valhalla
+    environment:
+      # Tell Valhalla to build tiles from this OSM file on first start
+      - use_tiles_ignore_pbf=False
+      - build_tar=True
+      # Traffic tile directory — Valhalla watches this for live updates
+      - traffic_dir=/data/traffic
+      # Tile cache refresh interval in seconds
+      - tile_update_interval=5
+    volumes:
+      # Your NYC OSM extract — Valhalla builds routing tiles from this
+      - ./data/valhalla:/custom_files
+      # Traffic tile hot-folder — your fetcher writes here
+      - ./data/traffic:/data/traffic
+    ports:
+      - "8002:8002"
+    networks:
+      - streaming-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 120s
+
+  # --- Traffic Fetcher ---
+  # traffic_fetcher:
+  #   build:
+  #     context: ./src/simulators/traffic
+  #     dockerfile: Dockerfile.traffic
+  #   volumes:
+  #     - ./data/traffic:/data/traffic 
+  #     - ./data/nyc_to_valhalla_mapping.csv:/data/nyc_to_valhalla_mapping.csv
+  #   logging:
+  #     driver: "json-file"
+  #     options:
+  #       max-size: "10m"
+  #       max-file: "3"
+  #   depends_on:
+  #     valhalla:
+  #       condition: service_healthy
+  #   networks:
+  #     - streaming-net
+
   # --- Apache Spark ---
   dispatch-engine:
     image: apache/spark:3.5.1-python3
@@ -161,5 +208,6 @@ services:
       - redpanda
       - console
       - postgres
+      - valhalla
       - pgadmin
       - python-incident-simulator

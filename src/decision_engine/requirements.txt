@@ -3,3 +3,4 @@ psycopg2-binary==2.9.9
 pyspark==3.5.1
 pandas==2.0.3
 pyarrow>=4.0.0
+polyline
