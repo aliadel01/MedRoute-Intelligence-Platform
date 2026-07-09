@@ -9,9 +9,11 @@
 # ════════════════════════════════════════════════════════════════
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
+import polyline
 
 import pandas as pd
 import psycopg2
@@ -19,7 +21,7 @@ import psycopg2.pool
 import requests
 
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, current_timestamp, from_json, lit, struct, to_json
+from pyspark.sql.functions import col, current_timestamp, from_json, lit, struct, to_json, when
 from pyspark.sql.types import (
     ArrayType, DoubleType, IntegerType, StringType,
     StructField, StructType, TimestampType,
@@ -78,9 +80,8 @@ JDBC_PROPS = {
 }
 PG_TABLE = "dispatched_routes"
 
-OSRM_TABLE_URL   = "http://osrm:5000/table/v1/driving"
-OSRM_ROUTE_URL   = "http://osrm:5000/route/v1/driving"
-OSRM_TIMEOUT_SEC = 3
+VALHALLA_URL      = "http://valhalla:8002"
+VALHALLA_TIMEOUT  = 5
 
 SEARCH_RADIUS_METERS = 30_000  
 REQUIRED_BEDS = {1: 1, 2: 3, 3: 5, 4: 10}
@@ -193,35 +194,103 @@ def _query_nearest_hospitals(db_pool, lon: float, lat: float) -> list[dict]:
         if conn:
             db_pool.putconn(conn)
 
-def _enrich_with_osrm_table(session, inc_lon, inc_lat, hospitals: list[dict]) -> list[dict]:
-    coords = [f"{inc_lon},{inc_lat}"] + [f"{h['lon']},{h['lat']}" for h in hospitals]
-    params = {
-        "sources":      "0",
-        "destinations": ";".join(str(i) for i in range(1, len(hospitals) + 1)),
-        "annotations":  "duration,distance",
+def _enrich_with_valhalla(session, inc_lat, inc_lon, hospitals: list[dict]) -> list[dict]:
+    """
+    Call Valhalla /sources_to_targets (matrix API) to get travel times
+    from the incident to all candidate hospitals simultaneously.
+    Uses live traffic automatically — no extra config needed.
+    """
+    sources = [{"lat": inc_lat, "lon": inc_lon}]
+    targets = [{"lat": h["lat"], "lon": h["lon"]} for h in hospitals]
+
+    payload = {
+        "sources": sources,
+        "targets": targets,
+        "costing": "auto",             # auto = car routing
+        "costing_options": {
+            "auto": {
+                "use_traffic": 1.0     # 1.0 = fully use live traffic speeds
+            }
+        },
+        "units": "kilometers"
     }
+
     try:
-        resp = session.get(
-            f"{OSRM_TABLE_URL}/{';'.join(coords)}",
-            params=params,
-            timeout=OSRM_TIMEOUT_SEC,
+        resp = session.post(
+            f"{VALHALLA_URL}/sources_to_targets",
+            json=payload,
+            timeout=VALHALLA_TIMEOUT,
         )
         if resp.status_code == 200:
-            data      = resp.json()
-            durations = data["durations"][0]
-            distances = data["distances"][0]
-            for i, h in enumerate(hospitals):
-                h["duration_sec"]    = float(durations[i]) if durations[i] is not None else -1.0
-                h["distance_meters"] = float(distances[i]) if distances[i] is not None else -1.0
-            return hospitals
-        _osrm_t_log.error("OSRM table HTTP bad status response returned: %d.", resp.status_code)
-    except Exception:
-        _osrm_t_log.error("OSRM table request payload processing failed.", exc_info=True)
+            data = resp.json()
+            # sources_to_targets returns: {"sources_to_targets": [[{time, distance}, ...]]}
+            matrix = data["sources_to_targets"][0]   # one row per source (just our incident)
 
+            for i, h in enumerate(hospitals):
+                cell = matrix[i] if i < len(matrix) else {}
+                # time is in seconds, distance is in km
+                h["duration_sec"]    = float(cell.get("time",     -1) or -1)
+                h["distance_meters"] = float(cell.get("distance", -1) or -1) * 1000
+            return hospitals
+
+        _osrm_t_log.error("Valhalla matrix HTTP %d.", resp.status_code)
+
+    except Exception:
+        _osrm_t_log.error("Valhalla matrix request failed.", exc_info=True)
+
+    # Fallback — sentinel values
     for h in hospitals:
         h.setdefault("duration_sec",    -1.0)
         h.setdefault("distance_meters", -1.0)
     return hospitals
+
+def _fetch_route_geometry(session, inc_lat, inc_lon, hospital: dict) -> str:
+    """
+    Call Valhalla /route and decode the returned Polyline6 string 
+    into a GeoJSON LineString for Grafana compatibility.
+    """
+    payload = {
+        "locations": [
+            {"lat": inc_lat, "lon": inc_lon},
+            {"lat": hospital["lat"], "lon": hospital["lon"]}
+        ],
+        "costing": "auto",
+        "costing_options": {
+            "auto": {"use_traffic": 1.0}
+        },
+        "units": "kilometers"
+    }
+
+    try:
+        resp = session.post(
+            f"{VALHALLA_URL}/route",
+            json=payload,
+            timeout=VALHALLA_TIMEOUT,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            legs = data.get("trip", {}).get("legs", [])
+            if legs:
+                shape = legs[0].get("shape")
+                
+                if shape and isinstance(shape, str):
+                    
+                    decoded_coords = polyline.decode(shape, precision=6)
+                
+                    geojson_coords = [[pt[1], pt[0]] for pt in decoded_coords]
+                    
+                    return json.dumps({
+                        "type": "LineString",
+                        "coordinates": geojson_coords
+                    })
+                    
+        else:
+            _osrm_r_log.error("Valhalla route HTTP %d. Response: %s", resp.status_code, resp.text)
+
+    except Exception:
+        _osrm_r_log.error("Valhalla route request failed.", exc_info=True)
+
+    return "Route Not Found"
 
 def _select_best_hospital(severity: int, hospitals: list[dict]) -> dict | None:
     if not hospitals:
@@ -243,23 +312,6 @@ def _select_best_hospital(severity: int, hospitals: list[dict]) -> dict | None:
         required_beds, severity, sorted_h[0]["name"],
     )
     return sorted_h[0]
-
-def _fetch_route_geometry(session, inc_lon, inc_lat, hospital: dict) -> str:
-    params = {"overview": "full", "geometries": "geojson"}
-    try:
-        resp = session.get(
-            f"{OSRM_ROUTE_URL}/{inc_lon},{inc_lat};{hospital['lon']},{hospital['lat']}",
-            params=params,
-            timeout=2,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("routes"):
-                return str(data["routes"][0]["geometry"])
-        _osrm_r_log.error("OSRM route payload retrieval failed with HTTP status: %d.", resp.status_code)
-    except Exception:
-        _osrm_r_log.error("OSRM route geometry integration request failed.", exc_info=True)
-    return "Route Not Found"
 
 # ────────────────────────────────────────────────────────────────
 # Vectorized Batch Iterator Execution (mapInPandas Layout)
@@ -289,10 +341,10 @@ def process_batch(iterator):
 
                 hospitals = _query_nearest_hospitals(db_pool, lon, lat)
                 if hospitals:
-                    hospitals = _enrich_with_osrm_table(session, lon, lat, hospitals)
+                    hospitals =  _enrich_with_valhalla(session, lat, lon, hospitals)
 
                 best = _select_best_hospital(severity, hospitals)
-                route_geometry = _fetch_route_geometry(session, lon, lat, best) if best else "Route Not Found"
+                route_geometry = _fetch_route_geometry(session, lat, lon, best) if best else "Route Not Found"
 
                 results.append({
                     "incident_id":           row["ID"],
@@ -329,15 +381,32 @@ def write_to_sinks(batch_df, batch_id):
 
         batch_df.persist()
 
-        valid_df = batch_df.filter(col("target_hospital_name").isNotNull())
-        dlq_df   = batch_df.filter(col("target_hospital_name").isNull())
+        # ────────────────────────────────────────────────────────────
+        # Split Data: Valid Routes vs DLQ (No Hospital OR Route Failed)
+        # ────────────────────────────────────────────────────────────
+        # Valid records must have a target hospital AND a successfully computed geometry
+        valid_df = batch_df.filter(
+            (col("target_hospital_name").isNotNull()) & 
+            (col("route_geometry") != "Route Not Found")
+        )
+        
+        # DLQ records: Either hospital lookup breached capacity, or Valhalla routing failed
+        dlq_df = batch_df.filter(
+            (col("target_hospital_name").isNull()) | 
+            (col("route_geometry") == "Route Not Found")
+        )
 
+        # ────────────────────────────────────────────────────────────
+        # Sink Execution: Valid Routes
+        # ────────────────────────────────────────────────────────────
         if not valid_df.isEmpty():
+            # 1. Write to PostgreSQL
             valid_df.write \
                 .mode("append") \
                 .jdbc(url=JDBC_URL, table=PG_TABLE, properties=JDBC_PROPS)
             _sink_log.info("Batch %d → Postgres '%s' ✓", batch_id, PG_TABLE)
 
+            # 2. Write to Production Kafka Topic
             (
                 valid_df
                 .select(
@@ -352,11 +421,20 @@ def write_to_sinks(batch_df, batch_id):
             )
             _sink_log.info("Batch %d → Kafka '%s' ✓", batch_id, KAFKA_OUT_TOPIC)
 
+        # ────────────────────────────────────────────────────────────
+        # Sink Execution: Dead Letter Queue (DLQ)
+        # ────────────────────────────────────────────────────────────
         if not dlq_df.isEmpty():
+            
+            # Dynamically attach the proper structural reason for routing to DLQ
+            dlq_enriched_df = dlq_df.withColumn(
+                "dlq_reason",
+                when(col("target_hospital_name").isNull(), "No hospital found within search radius / capacity breach")
+                .otherwise("Valhalla engine failed to resolve road network route geometry")
+            ).withColumn("dlq_timestamp", current_timestamp())
+
             (
-                dlq_df
-                .withColumn("dlq_reason",    lit("No hospital found within search radius / capacity breach"))
-                .withColumn("dlq_timestamp", current_timestamp())
+                dlq_enriched_df
                 .select(
                     col("incident_id").cast("string").alias("key"),
                     to_json(struct("*")).alias("value"),
@@ -368,7 +446,7 @@ def write_to_sinks(batch_df, batch_id):
                 .save()
             )
             _sink_log.warning("Batch %d → DLQ '%s' (%d failed records routed) ✓", 
-                              batch_id, KAFKA_DLQ_TOPIC, dlq_df.count())
+                             batch_id, KAFKA_DLQ_TOPIC, dlq_df.count())
 
     except Exception as exc:
         _sink_log.error("Batch %d sink runtime writing execution error encountered: %s", batch_id, exc, exc_info=True)
