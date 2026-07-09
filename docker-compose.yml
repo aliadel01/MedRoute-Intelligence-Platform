@@ -128,22 +128,6 @@ services:
     depends_on:
       - postgres
 
-  # --- OSRM Routing Engine ---
-  osrm:
-    image: osrm/osrm-backend:latest
-    container_name: medroute_osrm
-    command: >
-      bash -c "bash /app/traffic_updater.sh & 
-      exec osrm-routed --algorithm mld /data/nyc-roads.osrm"
-    volumes:
-      - ./data/osrm:/data
-      - ./src/simulators/routing/traffic_updater.sh:/app/traffic_updater.sh
-    ports:
-      - "5000:5000"
-    networks:
-      - streaming-net
-
-
   # --- Grafana ---
   grafana:
     image: grafana/grafana:latest
@@ -178,22 +162,4 @@ services:
       - console
       - postgres
       - pgadmin
-      - osrm
       - python-incident-simulator
-
-  # --- Traffic Fetcher ---
-  traffic_fetcher:
-    build:
-      context: ./src/simulators/routing
-      dockerfile: Dockerfile.traffic
-    volumes:
-      - ./data/osrm:/data
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    depends_on:
-      - osrm
-    networks:
-      - streaming-net
