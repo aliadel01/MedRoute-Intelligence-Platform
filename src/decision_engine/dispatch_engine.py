@@ -86,6 +86,8 @@ VALHALLA_TIMEOUT  = 5
 SEARCH_RADIUS_METERS = 30_000  
 REQUIRED_BEDS = {1: 1, 2: 3, 3: 5, 4: 10}
 
+HOSPITAL_TABLE = os.getenv("HOSPITAL_TABLE", "hospitals_olap")
+
 # ────────────────────────────────────────────────────────────────
 # Spark session
 # ────────────────────────────────────────────────────────────────
@@ -170,9 +172,9 @@ def _query_nearest_hospitals(db_pool, lon: float, lat: float) -> list[dict]:
         conn = db_pool.getconn()
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT name, latitude, longitude, COALESCE(icu_beds, 0)
-                FROM hospitals
+                FROM {HOSPITAL_TABLE}
                 WHERE ST_DWithin(
                     geom,
                     ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography,

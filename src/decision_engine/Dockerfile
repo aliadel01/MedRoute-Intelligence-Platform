@@ -22,8 +22,8 @@ RUN mkdir -p /opt/spark/jars && \
     curl -sS https://repo1.maven.org/maven2/org/apache/commons/commons-pool2/2.11.1/commons-pool2-2.11.1.jar -o /opt/spark/jars/commons-pool2-2.11.1.jar && \
     curl -sS https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.1/postgresql-42.7.1.jar -o /opt/spark/jars/postgresql-42.7.1.jar
     
-# Copy your processing engine script
-COPY dispatch_engine.py .
+# Copy processing engine scripts
+COPY *.py .
 
 # Switch back to standard spark user for secure container privileges
 USER spark

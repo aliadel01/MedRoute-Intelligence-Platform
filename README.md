@@ -346,6 +346,15 @@ python dispatch_api.py
 spark-submit spark_scoring.py
 ```
 
+### Start hospitals CDC to OLAP sync
+
+```bash
+docker compose up -d hospitals-olap-sync-engine
+```
+
+This Spark stream consumes Debezium CDC events from `medroute.public.hospitals`
+and keeps `hospitals_olap` in PostgreSQL synchronized via upsert/delete logic.
+
 ### Open dashboards
 
 Navigate to `http://localhost:3000` in your browser. Default credentials: `admin / admin`.

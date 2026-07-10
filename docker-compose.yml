@@ -211,3 +211,36 @@ services:
       - valhalla
       - pgadmin
       - python-incident-simulator
+
+  # --- ICU Changes Simulator ---
+  icu-sim:
+    build:
+      context: ./src/simulators/hospitals
+      dockerfile: Dockerfile
+    container_name: icu-simulator
+    command: python icu_sim.py
+    networks:
+      - streaming-net
+    depends_on:
+      - postgres
+
+  # --- Apache Spark Job for Hospitals OLAP Sync ---
+  hospitals-olap-sync-engine:
+    image: apache/spark:3.5.1-python3
+    build:
+      context: ./src/decision_engine
+      dockerfile: Dockerfile
+    container_name: medroute_hospitals_olap_sync
+    user: root
+    restart: unless-stopped
+    command: ["python3", "/opt/spark/jobs/hospitals_cdc_to_olap.py"]
+    volumes:
+      - ./src/decision_engine:/opt/spark/jobs
+      - ./src/decision_engine/checkpoints:/opt/spark/checkpoints
+    networks:
+      - streaming-net
+    depends_on:
+      - redpanda
+      - kafka-connect
+      - postgres
+      - icu-sim
