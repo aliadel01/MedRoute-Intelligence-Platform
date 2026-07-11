@@ -186,6 +186,8 @@ Slack alert to the target hospital's trauma team the second an ambulance is disp
 
 #### B. **Grafana**
 
+![Grafana Dashboard](grafana/routes.png)
+
 All dashboards are built in Grafana, reading from ClickHouse gold tables.
 
 | Dashboard | Source table | Refresh |

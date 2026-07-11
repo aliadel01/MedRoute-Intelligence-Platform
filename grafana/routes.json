@@ -1,0 +1,684 @@
+{
+  "apiVersion": "dashboard.grafana.app/v2",
+  "kind": "Dashboard",
+  "metadata": {
+    "name": "ems-map-dashboard",
+    "namespace": "default",
+    "uid": "5cceb2f1-8f9a-4066-9dd8-eb3e1a1e9f2f",
+    "resourceVersion": "1783757934193982",
+    "generation": 9,
+    "creationTimestamp": "2026-07-10T20:24:32Z",
+    "labels": {
+      "grafana.app/deprecatedInternalID": "4021745122451456"
+    },
+    "annotations": {
+      "grafana.app/createdBy": "user:bfqsuypf4y8lcb",
+      "grafana.app/folder": "",
+      "grafana.app/saved-from-ui": "Grafana v13.0.1 (a100054f)",
+      "grafana.app/updatedBy": "user:bfqsuypf4y8lcb",
+      "grafana.app/updatedTimestamp": "2026-07-11T08:18:54Z"
+    }
+  },
+  "spec": {
+    "annotations": [
+      {
+        "kind": "AnnotationQuery",
+        "spec": {
+          "query": {
+            "kind": "DataQuery",
+            "group": "grafana",
+            "version": "v0",
+            "datasource": {
+              "name": "-- Grafana --"
+            },
+            "spec": {}
+          },
+          "enable": true,
+          "hide": true,
+          "iconColor": "rgba(0, 211, 255, 1)",
+          "name": "Annotations & Alerts",
+          "builtIn": true
+        }
+      }
+    ],
+    "cursorSync": "Off",
+    "editable": true,
+    "elements": {
+      "panel-1": {
+        "kind": "Panel",
+        "spec": {
+          "id": 1,
+          "title": "",
+          "description": "",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "text",
+            "version": "13.0.1",
+            "spec": {
+              "options": {
+                "code": {
+                  "language": "plaintext",
+                  "showLineNumbers": false,
+                  "showMiniMap": false
+                },
+                "content": "**EMS Live Map** — currently showing: `${selected_incident}`  &nbsp;&nbsp;|&nbsp;&nbsp; [🔄 Reset view (show all hospitals + last 5 incidents)](d/ems-map-dashboard/ems-live-map?var-selected_incident=All)",
+                "mode": "markdown"
+              },
+              "fieldConfig": {
+                "defaults": {},
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-2": {
+        "kind": "Panel",
+        "spec": {
+          "id": 2,
+          "title": "Hospitals & Dispatch Routes",
+          "description": "",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "postgres",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${datasource}"
+                      },
+                      "spec": {
+                        "editorMode": "code",
+                        "format": "table",
+                        "rawQuery": true,
+                        "rawSql": "SELECT latitude, longitude, name, icu_beds\nFROM hospitals\n-- WHERE ('$selected_incident' = 'All')\n--   OR (name = (SELECT target_hospital_name FROM dispatched_routes WHERE incident_id = '$selected_incident'));",
+                        "sql": {
+                          "columns": [
+                            {
+                              "parameters": [],
+                              "type": "function"
+                            }
+                          ],
+                          "groupBy": [
+                            {
+                              "property": {
+                                "type": "string"
+                              },
+                              "type": "groupBy"
+                            }
+                          ],
+                          "limit": 50
+                        }
+                      }
+                    },
+                    "refId": "A",
+                    "hidden": false
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "postgres",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${datasource}"
+                      },
+                      "spec": {
+                        "editorMode": "code",
+                        "format": "table",
+                        "rawQuery": true,
+                        "rawSql": "SELECT \n    incident_lat AS latitude,\n    incident_lon AS longitude,\n    severity, \n    target_hospital_name, \n    travel_duration_seconds / 60.0 AS \"duration (m)\", \n    travel_distance_meters / 1000.0 AS \"distance (km)\"\nFROM dispatched_routes\nWHERE ('$selected_incident' = 'All') OR (incident_id = '$selected_incident')\nORDER BY processed_at DESC\nLIMIT 5;",
+                        "sql": {
+                          "columns": [
+                            {
+                              "parameters": [],
+                              "type": "function"
+                            }
+                          ],
+                          "groupBy": [
+                            {
+                              "property": {
+                                "type": "string"
+                              },
+                              "type": "groupBy"
+                            }
+                          ],
+                          "limit": 50
+                        }
+                      }
+                    },
+                    "refId": "B",
+                    "hidden": false
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "postgres",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${datasource}"
+                      },
+                      "spec": {
+                        "editorMode": "code",
+                        "format": "table",
+                        "rawQuery": true,
+                        "rawSql": "SELECT\n  point_order AS seq,\n  (point->>1)::double precision AS latitude,\n  (point->>0)::double precision AS longitude\nFROM (\n  SELECT route_geometry, incident_id,\n         ROW_NUMBER() OVER (ORDER BY processed_at DESC) AS rn\n  FROM dispatched_routes\n) r\nCROSS JOIN LATERAL jsonb_array_elements(\n  replace(r.route_geometry, '''', '\"')::jsonb -> 'coordinates'\n) WITH ORDINALITY AS t(point, point_order)\nWHERE ( '$selected_incident' = 'All' AND r.rn = 1 )\n   OR ( '$selected_incident' != 'All' AND r.incident_id = '$selected_incident' )\nORDER BY point_order;",
+                        "sql": {
+                          "columns": [
+                            {
+                              "parameters": [],
+                              "type": "function"
+                            }
+                          ],
+                          "groupBy": [
+                            {
+                              "property": {
+                                "type": "string"
+                              },
+                              "type": "groupBy"
+                            }
+                          ],
+                          "limit": 50
+                        }
+                      }
+                    },
+                    "refId": "C",
+                    "hidden": false
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "postgres",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${datasource}"
+                      },
+                      "spec": {
+                        "format": "table",
+                        "rawQuery": true,
+                        "rawSql": "SELECT\n  point_order AS seq,\n  (point->>1)::double precision AS latitude,\n  (point->>0)::double precision AS longitude\nFROM (\n  SELECT route_geometry, incident_id,\n         ROW_NUMBER() OVER (ORDER BY processed_at DESC) AS rn\n  FROM dispatched_routes\n) r\nCROSS JOIN LATERAL jsonb_array_elements(\n  replace(r.route_geometry, '''', '\"')::jsonb -> 'coordinates'\n) WITH ORDINALITY AS t(point, point_order)\nWHERE ( '$selected_incident' = 'All' AND r.rn = 2 )\n   OR ( '$selected_incident' != 'All' AND r.incident_id = '$selected_incident' )\nORDER BY point_order;"
+                      }
+                    },
+                    "refId": "D",
+                    "hidden": false
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "postgres",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${datasource}"
+                      },
+                      "spec": {
+                        "format": "table",
+                        "rawQuery": true,
+                        "rawSql": "SELECT\n  point_order AS seq,\n  (point->>1)::double precision AS latitude,\n  (point->>0)::double precision AS longitude\nFROM (\n  SELECT route_geometry, incident_id,\n         ROW_NUMBER() OVER (ORDER BY processed_at DESC) AS rn\n  FROM dispatched_routes\n) r\nCROSS JOIN LATERAL jsonb_array_elements(\n  replace(r.route_geometry, '''', '\"')::jsonb -> 'coordinates'\n) WITH ORDINALITY AS t(point, point_order)\nWHERE ( '$selected_incident' = 'All' AND r.rn = 3 )\n   OR ( '$selected_incident' != 'All' AND r.incident_id = '$selected_incident' )\nORDER BY point_order;"
+                      }
+                    },
+                    "refId": "E",
+                    "hidden": false
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "postgres",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${datasource}"
+                      },
+                      "spec": {
+                        "format": "table",
+                        "rawQuery": true,
+                        "rawSql": "SELECT\n  point_order AS seq,\n  (point->>1)::double precision AS latitude,\n  (point->>0)::double precision AS longitude\nFROM (\n  SELECT route_geometry, incident_id,\n         ROW_NUMBER() OVER (ORDER BY processed_at DESC) AS rn\n  FROM dispatched_routes\n) r\nCROSS JOIN LATERAL jsonb_array_elements(\n  replace(r.route_geometry, '''', '\"')::jsonb -> 'coordinates'\n) WITH ORDINALITY AS t(point, point_order)\nWHERE ( '$selected_incident' = 'All' AND r.rn = 4 )\n   OR ( '$selected_incident' != 'All' AND r.incident_id = '$selected_incident' )\nORDER BY point_order;"
+                      }
+                    },
+                    "refId": "F",
+                    "hidden": false
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "postgres",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${datasource}"
+                      },
+                      "spec": {
+                        "format": "table",
+                        "rawQuery": true,
+                        "rawSql": "SELECT\n  point_order AS seq,\n  (point->>1)::double precision AS latitude,\n  (point->>0)::double precision AS longitude\nFROM (\n  SELECT route_geometry, incident_id,\n         ROW_NUMBER() OVER (ORDER BY processed_at DESC) AS rn\n  FROM dispatched_routes\n) r\nCROSS JOIN LATERAL jsonb_array_elements(\n  replace(r.route_geometry, '''', '\"')::jsonb -> 'coordinates'\n) WITH ORDINALITY AS t(point, point_order)\nWHERE ( '$selected_incident' = 'All' AND r.rn = 5 )\n   OR ( '$selected_incident' != 'All' AND r.incident_id = '$selected_incident' )\nORDER BY point_order;"
+                      }
+                    },
+                    "refId": "G",
+                    "hidden": false
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "geomap",
+            "version": "13.0.1",
+            "spec": {
+              "options": {
+                "basemap": {
+                  "config": {
+                    "server": "custom",
+                    "showLabels": true,
+                    "theme": "auto"
+                  },
+                  "layer-tooltip": false,
+                  "name": "OpenStreetMap",
+                  "noRepeat": false,
+                  "opacity": 1,
+                  "type": "default"
+                },
+                "controls": {
+                  "mouseWheelZoom": true,
+                  "showAttribution": true,
+                  "showDebug": false,
+                  "showMeasure": false,
+                  "showScale": true,
+                  "showZoom": true
+                },
+                "layers": [
+                  {
+                    "config": {
+                      "showLegend": false,
+                      "style": {
+                        "color": {
+                          "fixed": "dark-blue"
+                        },
+                        "opacity": 0.9,
+                        "size": {
+                          "fixed": 7,
+                          "max": 15,
+                          "min": 4
+                        },
+                        "symbol": {
+                          "fixed": "img/icons/unicons/hospital-symbol.svg",
+                          "mode": "fixed"
+                        },
+                        "symbolAlign": {
+                          "horizontal": "center",
+                          "vertical": "center"
+                        }
+                      }
+                    },
+                    "filterData": {
+                      "id": "byRefId",
+                      "options": "A"
+                    },
+                    "location": {
+                      "mode": "auto"
+                    },
+                    "name": "Hospitals",
+                    "tooltip": true,
+                    "type": "markers"
+                  },
+                  {
+                    "config": {
+                      "showLegend": false,
+                      "style": {
+                        "color": {
+                          "field": "severity",
+                          "fixed": "#F2495C"
+                        },
+                        "opacity": 0.9,
+                        "size": {
+                          "fixed": 5,
+                          "max": 20,
+                          "min": 5
+                        },
+                        "symbol": {
+                          "field": "",
+                          "fixed": "",
+                          "mode": "fixed"
+                        }
+                      }
+                    },
+                    "filterData": {
+                      "id": "byRefId",
+                      "options": "B"
+                    },
+                    "location": {
+                      "mode": "auto"
+                    },
+                    "name": "Accidents (last 5)",
+                    "tooltip": true,
+                    "type": "markers"
+                  },
+                  {
+                    "config": {
+                      "style": {
+                        "arrow": 1,
+                        "color": {
+                          "fixed": "red"
+                        },
+                        "line": {
+                          "width": 3
+                        },
+                        "opacity": 0.8,
+                        "size": {
+                          "fixed": 2,
+                          "max": 15,
+                          "min": 2
+                        }
+                      }
+                    },
+                    "filterData": {
+                      "id": "byRefId",
+                      "options": "C"
+                    },
+                    "location": {
+                      "mode": "auto"
+                    },
+                    "name": "Route 1",
+                    "tooltip": true,
+                    "type": "route"
+                  },
+                  {
+                    "config": {
+                      "style": {
+                        "arrow": 1,
+                        "color": {
+                          "fixed": "red"
+                        },
+                        "line": {
+                          "width": 3
+                        },
+                        "opacity": 0.8,
+                        "size": {
+                          "fixed": 2,
+                          "max": 15,
+                          "min": 2
+                        }
+                      }
+                    },
+                    "filterData": {
+                      "id": "byRefId",
+                      "options": "D"
+                    },
+                    "location": {
+                      "mode": "auto"
+                    },
+                    "name": "Route 2",
+                    "tooltip": true,
+                    "type": "route"
+                  },
+                  {
+                    "config": {
+                      "style": {
+                        "arrow": 1,
+                        "color": {
+                          "fixed": "red"
+                        },
+                        "line": {
+                          "width": 3
+                        },
+                        "opacity": 0.8,
+                        "size": {
+                          "fixed": 2,
+                          "max": 15,
+                          "min": 2
+                        }
+                      }
+                    },
+                    "filterData": {
+                      "id": "byRefId",
+                      "options": "E"
+                    },
+                    "location": {
+                      "mode": "auto"
+                    },
+                    "name": "Route 3",
+                    "tooltip": true,
+                    "type": "route"
+                  },
+                  {
+                    "config": {
+                      "style": {
+                        "arrow": 1,
+                        "color": {
+                          "fixed": "red"
+                        },
+                        "line": {
+                          "width": 3
+                        },
+                        "opacity": 0.8,
+                        "size": {
+                          "fixed": 2,
+                          "max": 15,
+                          "min": 2
+                        }
+                      }
+                    },
+                    "filterData": {
+                      "id": "byRefId",
+                      "options": "F"
+                    },
+                    "location": {
+                      "mode": "auto"
+                    },
+                    "name": "Route 4",
+                    "tooltip": true,
+                    "type": "route"
+                  },
+                  {
+                    "config": {
+                      "style": {
+                        "arrow": 1,
+                        "color": {
+                          "fixed": "red"
+                        },
+                        "line": {
+                          "width": 3
+                        },
+                        "opacity": 0.8,
+                        "size": {
+                          "fixed": 2,
+                          "max": 15,
+                          "min": 2
+                        }
+                      }
+                    },
+                    "filterData": {
+                      "id": "byRefId",
+                      "options": "G"
+                    },
+                    "location": {
+                      "mode": "auto"
+                    },
+                    "name": "Route 5",
+                    "tooltip": true,
+                    "type": "route"
+                  }
+                ],
+                "tooltip": {
+                  "mode": "details"
+                },
+                "view": {
+                  "allLayers": true,
+                  "dashboardVariable": false,
+                  "id": "fit",
+                  "lat": 0,
+                  "lon": 0,
+                  "noRepeat": false,
+                  "zoom": 10
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "value": 0,
+                        "color": "green"
+                      },
+                      {
+                        "value": 2,
+                        "color": "yellow"
+                      },
+                      {
+                        "value": 3,
+                        "color": "orange"
+                      },
+                      {
+                        "value": 4,
+                        "color": "dark-red"
+                      }
+                    ]
+                  },
+                  "custom": {
+                    "hideFrom": {
+                      "legend": false,
+                      "tooltip": false,
+                      "viz": false
+                    }
+                  }
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      }
+    },
+    "layout": {
+      "kind": "GridLayout",
+      "spec": {
+        "items": [
+          {
+            "kind": "GridLayoutItem",
+            "spec": {
+              "x": 0,
+              "y": 0,
+              "width": 24,
+              "height": 2,
+              "element": {
+                "kind": "ElementReference",
+                "name": "panel-1"
+              }
+            }
+          },
+          {
+            "kind": "GridLayoutItem",
+            "spec": {
+              "x": 0,
+              "y": 2,
+              "width": 24,
+              "height": 13,
+              "element": {
+                "kind": "ElementReference",
+                "name": "panel-2"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "links": [],
+    "liveNow": false,
+    "preload": false,
+    "tags": [
+      "ems",
+      "geomap",
+      "dispatch"
+    ],
+    "timeSettings": {
+      "timezone": "browser",
+      "from": "now-24h",
+      "to": "now",
+      "autoRefresh": "1m",
+      "autoRefreshIntervals": [
+        "5s",
+        "10s",
+        "30s",
+        "1m",
+        "5m",
+        "15m",
+        "30m",
+        "1h",
+        "2h",
+        "1d"
+      ],
+      "hideTimepicker": false,
+      "fiscalYearStartMonth": 0
+    },
+    "title": "EMS Live Map 2",
+    "variables": [
+      {
+        "kind": "DatasourceVariable",
+        "spec": {
+          "name": "datasource",
+          "pluginId": "postgres",
+          "refresh": "onDashboardLoad",
+          "regex": "",
+          "current": {
+            "text": "medroute-postgres",
+            "value": "afqx3gni74hdse"
+          },
+          "options": [],
+          "multi": false,
+          "includeAll": false,
+          "label": "PostgreSQL Data Source",
+          "hide": "dontHide",
+          "skipUrlSync": false,
+          "allowCustomValue": true
+        }
+      },
+      {
+        "kind": "TextVariable",
+        "spec": {
+          "name": "selected_incident",
+          "current": {
+            "text": "All",
+            "value": "All"
+          },
+          "query": "All",
+          "label": "Selected Incident",
+          "hide": "dontHide",
+          "skipUrlSync": false,
+          "description": "Set by clicking a row in the Accident Table dashboard. Set to 'All' (or use the Reset link) to show every hospital and the last 5 incidents."
+        }
+      }
+    ]
+  }
+}
