@@ -1,13 +1,6 @@
 # MedRoute Intelligence Platform
 
-Traditional emergency dispatch systems route ambulances to the _geographically closest_ hospital. However, this often leads to critical failures: the closest hospital might have a full Intensive Care Unit (ICU), or it may lack a specialized surgeon (e.g., a neurosurgeon for a severe head trauma).
-
-**MedRoute Intelligence** solves this by building a real-time data platform that ingests live crash data, traffic congestion, and live hospital resource capacities. A smart orchestrator then dispatches the ambulance via the fastest traffic route to the **most optimal and prepared** hospital, saving lives when every second counts.
-
----
-
 ## Table of Contents
-
 - [Overview](#overview)
 - [Architecture](#architecture)
 - [Data Sources](#data-sources)
@@ -20,388 +13,187 @@ Traditional emergency dispatch systems route ambulances to the _geographically c
 - [Data Flow](#data-flow)
 - [Project Structure](#project-structure)
 - [Getting Started](#getting-started)
-- [Orchestration](#orchestration)
-- [Governance & Catalog](#governance--catalog)
-- [Deployment](#deployment)
 
 ---
 
 ## Overview
 
-When a 911 call comes in, every second matters. MedRoute is a data platform that continuously ingests real-time ambulance positions, hospital ICU capacity, live traffic conditions, and active incident data — then uses a weighted scoring algorithm to recommend the best hospital for each patient, considering travel time, bed availability, specialty match, and current ER load.
+When a 911 call comes in, every second matters. MedRoute is a real-time data platform that continuously ingests hospital ICU capacity, static traffic conditions, and active incident data — then uses a weighted scoring algorithm to recommend the best hospital for each patient, considering travel time and bed availability.
 
-The platform is built on a modern data stack that separates concerns clearly: raw ingestion, analytical storage with a medallion architecture, a Spark-powered decision engine, and Grafana dashboards for operators and analysts.
+The platform is built on a modern event-driven data stack that separates concerns clearly: raw streaming ingestion via Apache Kafka, a storage layer powered by Postgres, a Spark-powered decision engine, and live Grafana dashboards for incident route visualization and system monitoring.
 
 
 ## Architecture
 
-![Architecture Diagram](docs/architecture.png)
+![MedRoute Architecture Diagram](docs/architecture.png)
 
 
 ## Data Sources
 
-### Batch — Static / Daily
-
-| Source | Format | Update frequency | Purpose |
-|---|---|---|---|
-| CMS Provider Data | CSV / API | Daily | Hospital registry, specialties, certifications |
-| HIFLD Open | Shapefile / GeoJSON | Weekly | Geographic boundaries, facility locations |
-| OpenStreetMap | PBF / GeoJSON | Weekly | Road network for routing calculations |
-
-### Historical / Simulation
+### Batch & Static Reference Data
 
 | Source | Format | Purpose |
-|---|---|---|
-| NYC Open Data | CSV | Historical incident data for simulation and benchmarking |
-| US Accidents Dataset | CSV | Historical accident patterns for model validation |
+| --- | --- | --- |
+| HIFLD Open | GeoJSON | Geographic boundaries and facility coordinates |
+| OpenStreetMap | PBF / GeoJSON | Static road network graph for routing calculations |
 
 ### Streaming — Real-time
 
 | Source | Type | Kafka topic | Description |
-|---|---|---|---|
-| Python Incident Simulator | Producer | `incident_stream` | Simulates incoming 911 calls with location and severity |
-| Python GPS Simulator | Producer | `ambulance_gps` | Simulates real-time ambulance position updates |
-| ICU Capacity DB (OLTP) | Debezium CDC | `hospital_icu_capacity` | Streams every INSERT/UPDATE from the ICU Postgres database via write-ahead log |
-
-### On-demand
-
-| Source | Pattern | Used by |
-|---|---|---|
-| TomTom Traffic API | REST pull at scoring time | Apache Spark pulls current traffic conditions for each candidate route during hospital scoring — not streamed continuously |
+| --- | --- | --- | --- |
+| Incident Simulator | Producer | `incident_stream` | Simulates incoming 911 calls with real-time location and severity data |
+| Hospital Capacity Stream | Producer | `hospital_icu_capacity` | Streams real-time updates of available ICU and ER beds using CDC via Debezium |
+| 
 
 
 ## Layer-by-Layer Breakdown
 
 ### 1. Ingestion Layer
 
-**Batch ingestion — Python script**
+**Batch Ingestion — Python Core**
 
-A Python script scheduled by Airflow handles all static and daily sources. It connects to each source, reads new records using an incremental watermark where available, and writes raw data directly to the ClickHouse bronze layer. No transformation happens here — the data lands exactly as received.
+A set of robust Python utility scripts handles the extraction and parsing of all static reference datasets (OSM road networks and hospital registries). The data is loaded directly into the Postgres storage engine as historical context.
 
-**Streaming ingestion — Kafka**
+**Streaming Ingestion — Apache Kafka**
 
-Three Kafka topics receive real-time events from their respective producers:
+Real-time operational events are handled by a distributed message broker across two dedicated Kafka topics:
 
-- `incident_stream` — each new 911 incident as a JSON event
-- `ambulance_gps` — GPS position update per ambulance every 2 seconds
-- `hospital_icu_capacity` — ICU bed count changes from the operational database
-
-**Debezium (Change Data Capture)**
-
-The ICU Capacity database is an operational Postgres instance managed by hospital systems. We do not modify it or query it directly for analytics. Instead, Debezium reads the Postgres write-ahead log and publishes every INSERT, UPDATE, and DELETE as an event to the `hospital_icu_capacity` Kafka topic. This gives us a real-time stream of capacity changes without touching the production database.
+- `incident_stream`: Dispatches JSON payloads for every newly reported emergency incident.
+- `hospital_icu_capacity`: Streams instant shifts in hospital resource availability.
 
 **Kafka Consumers**
 
-A set of consumers reads from all three Kafka topics and writes each event to the ClickHouse bronze layer. Consumers are independent per topic so that a slowdown in one does not affect the others.
+Lightweight, decoupled Python consumers continuously listen to the active Kafka topics, parsing incoming JSON streams and committing them instantly into the Postgres storage subsystem with minimal ingestion latency.
 
 ---
 
 ### 2. Storage & Transformation Layer
 
-All data — batch and streaming — flows into a single ClickHouse analytical warehouse organized using the medallion architecture.
-
-**Why ClickHouse?**
-
-ClickHouse is a column-oriented OLAP database. When a dashboard query aggregates millions of GPS events to compute average response times, ClickHouse reads only the columns needed and skips the rest. This makes analytical aggregations 10–50x faster than a row-oriented database like Postgres at the same data volume.
-
-#### Bronze — raw
-
-The exact copy of every record as it arrived. No cleaning, no transformation, no filtering. Both batch files and streaming events land here first.
-
-- Append-only — records are never updated or deleted
-- Used as the source of truth for all downstream transformations
-- Enables full reprocessing if a transformation bug is found later
-
-#### Silver — validated
-
-Bronze data after cleaning and standardisation:
-
-- Data types are cast to correct formats (timestamps, floats, enums)
-- Duplicate records are removed
-- Null values are handled according to per-field rules
-- Schema is normalised across sources that represent the same concept differently
-- Business rules are applied (e.g. reject GPS coordinates outside valid bounds)
-- No aggregation happens here — silver is still row-level data
-
-#### Gold — batch path
-
-Enriched, joined reference tables built from silver batch data. Rebuilt on schedule by Airflow triggering dbt.
-
-| Table | Description |
-|---|---|
-| `gold_hospitals_base` | Clean hospital registry with all attributes |
-| `gold_hospitals_geo` | Hospital locations as PostGIS-compatible geometry |
-| `gold_road_network` | Routable road graph from OpenStreetMap |
-
-#### Gold — streaming path
-
-Near-real-time operational tables updated continuously from streaming silver data. These power live dashboards and feed Spark at scoring time.
-
-| Table | Description |
-|---|---|
-| `gold_active_incidents` | All currently open 911 incidents |
-| `gold_live_hospital_capacity` | Current ICU bed counts per hospital |
-| `gold_ambulance_live_location` | Latest GPS position per ambulance |
-| `gold_dispatch_decisions` | History of all Spark-generated routing recommendations |
-
-#### dbt
-
-dbt manages all transformations from bronze through silver to gold. It provides:
-
-- **Transformation**: SQL models that define every bronze → silver → gold step
-- **Testing**: automated assertions (not-null, unique keys, accepted value ranges, referential integrity)
-- **Documentation**: auto-generated data dictionary for every model and column
-- **Lineage**: full DAG showing how every gold table traces back to its raw source
-
-dbt runs are scheduled and triggered by Airflow.
+All data streams and static lookup files flow into **Postgres** to benefit from PostGIS functionality which enables geospatial queries and routing calculations.
 
 ---
 
 ### 3. Decision Engine
 
-The decision engine fires when a new incident arrives in `gold_active_incidents`.
+The core computational engine is triggered immediately when a new record enters the active incidents log.
 
-**Apache Spark — hospital scoring**
+**Apache Spark — Real-time Distributed Triage & Matrix Routing**
 
-Spark reads from the gold tables and scores every candidate hospital within a configurable radius of the incident using a weighted formula:
+Apache Spark acts as the central brain of the platform. It consumes the incoming streaming logs and runs high-performance Vectorized Worker Iterators via mapInPandas across all candidate hospitals within the immediate perimeter of the incident:
 
-```
-score = w1 × (1 / travel_time)
-      + w2 × icu_beds_available
-      + w3 × specialty_match
-      + w4 × (1 / er_wait_time)
-```
+- Spatial Proximity: Filters and indexes the nearest 5 hospitals within a 30km perimeter via PostGIS spatial KNN lookups.
 
-Travel time is computed using TomTom's traffic API called on-demand at scoring time — Spark pulls current traffic conditions for each candidate route rather than maintaining a continuous traffic stream. This keeps Kafka clean and avoids storing traffic data that is only useful for seconds.
+- Real-time Traffic Routing: Dispatches geographic coordinates to Valhalla's matrix engine to calculate concurrent travel times using live traffic telemetry.
 
-Spark selects the hospital with the highest score and emits the recommendation.
+- Resource Constraints: Enforces strict bed capacity thresholds dynamically mapped to the incident's severity level, with a safety fallback to the fastest facility.
+
+Spark isolates the optimal hospital destination that satisfies the resource constraints, generates a map-ready GeoJSON path, and coordinates transaction boundaries across a decoupled multi-sink grid—streaming successful dispatches to PostgreSQL and Redpanda, while routing capacity or engine failures into a dedicated Dead Letter Queue (DLQ).
 
 ---
 
 ### 4. Product & Dashboards
 
-#### A. **Twilio**
+#### Grafana Operator Dashboard
 
-Slack alert to the target hospital's trauma team the second an ambulance is dispatched to them, detailing the ETA and patient condition.
+The front-end operational interface is powered by Grafana, querying Postgres analytics tables natively.
 
-#### B. **Grafana**
+- **Accident Route Visualizer:** Displays active accident locations mapped alongside the calculated optimal paths to recommended treatment facilities.
 
-![Grafana Dashboard](grafana/routes.png)
+![grafana_dashboard](grafana/routes.png)
 
-All dashboards are built in Grafana, reading from ClickHouse gold tables.
-
-| Dashboard | Source table | Refresh |
-|---|---|---|
-| Live Ambulance Map | `gold_ambulance_live_location` | 2-second auto-refresh |
-| Hospital Capacity Heatmap | `gold_live_hospital_capacity` | 30-second auto-refresh |
-| Incident Response Times (KPIs) | `gold_dispatch_decisions` + `gold_active_incidents` | 1-minute refresh |
-
-Grafana also handles **monitoring and alerts** — pipeline health metrics including Kafka consumer lag, dbt run success rate, Airflow DAG status, and ClickHouse query latency.
+#### Twilio SMS Notifications
+Alert hospital staff and emergency responders with real-time routing recommendations via Twilio SMS API integration.
 
 
 ## Tech Stack
 
-| Tool | Role | Why this tool |
-|---|---|---|
-| Apache Kafka | Streaming message broker | Decouples producers from consumers, durable, supports multiple independent consumers per topic |
-| Debezium | Change Data Capture | Reads Postgres WAL without modifying the source database or application code |
-| Python | Batch ingestion scripts | Simple, flexible, extensive connector ecosystem |
-| ClickHouse | Analytical warehouse | Column-oriented storage makes aggregation queries 10–50x faster than row-oriented databases at scale |
-| dbt | SQL transformation layer | Version-controlled transformations, built-in testing, automatic lineage documentation |
-| Apache Spark | Decision engine compute | Distributed scoring across large candidate sets, handles complex weighted formulas, extensible to ML |
-| TomTom API | Live traffic data | On-demand pull at scoring time — no need to stream and store continuously changing traffic data |
-| Grafana | Dashboards and alerting | Native ClickHouse integration, strong time-series support, alerting built-in |
-| Apache Airflow | Pipeline orchestration | Schedules batch ingestion and dbt runs, handles retries, provides full DAG visibility |
-| OpenMetadata | Data governance and catalog | Central registry for all datasets, owners, quality scores, and lineage across the platform |
-| Docker | Containerisation | Consistent environments across development and production, all services defined as code |
-| Terraform | Infrastructure as code | Defines cloud resources for production deployment, version-controlled, reproducible |
+| Tool | Role | Focus Area |
+| :--- | :--- | :--- |
+| **Apache Kafka** | Distributed Message Broker | Real-time event streaming and ingestion decoupling |
+| **Python** | System Scripting & Consumers | Ingestion orchestration and simulator components |
+| **Postgres** | Relational Database | Persistent storage for incident and hospital data |
+| **Apache Spark** | Distributed Compute Engine | Executing the real-time weighted hospital scoring matrix |
+| **Debezium** | Change Data Capture | Streaming Postgres changes to Kafka topics |
+| **Valhalla** | Routing Engine | Open-source routing engine for travel time estimation |
+| **Grafana** | Operational Visualization | Interactive routing dashboards and infrastructure metrics |
+| **Docker** | Component Containerization | Unified local deployment and microservice sandboxing |
+
 
 
 ## Project Structure
 
-```
+```text
 medroute-intelligence-platform/
 │
-├── ingestion/
-│   ├── batch/
-│   │   ├── cms_provider.py          # CMS data ingestion
-│   │   ├── hifld_open.py            # HIFLD shapefile ingestion
-│   │   └── openstreetmap.py         # OSM road network ingestion
-│   └── streaming/
-│       ├── incident_simulator.py    # Kafka producer — incidents
-│       ├── gps_simulator.py         # Kafka producer — GPS
-│       └── kafka_consumer.py        # Consumers → ClickHouse bronze
+├── config/                             # Infrastructure and service configurations
+│   ├── hifld-connector.json            # Debezium/Kafka connector settings for CDC
+│   └── postgresql.conf                 # Performance tuning configuration for PostgreSQL
 │
-├── transformation/
-│   └── dbt_project/
-│       ├── models/
-│       │   ├── bronze/              # Raw source models
-│       │   ├── silver/              # Validated, cleaned models
-│       │   └── gold/
-│       │       ├── batch/           # hospitals_base, geo, road_network
-│       │       └── streaming/       # active_incidents, live_capacity, etc.
-│       ├── tests/                   # dbt data quality tests
-│       └── dbt_project.yml
+├── data/                               # Local persistent storage or volume mounts
 │
-├── decision_engine/
-│   ├── spark_scoring.py             # Hospital scoring job
-│   ├── dispatch_api.py              # FastAPI dispatch endpoint
-│   └── reverse_etl.py               # Write decisions back to Postgres
+├── grafana/                            # Metrics and routing visualizations
+│   ├── routes.json                     # Main map dashboard panel export
+│   └── routes.png                      # Dashboard UI preview screenshot
 │
-├── dashboards/
-│   └── grafana/
-│       ├── live_ambulance_map.json
-│       ├── hospital_capacity.json
-│       └── incident_kpis.json
+├── scripts/                            # Operational management scripts
 │
-├── orchestration/
-│   └── airflow/
-│       ├── dags/
-│       │   ├── batch_ingestion_dag.py
-│       │   └── dbt_transformation_dag.py
-│       └── plugins/
+├── src/                                # Main application source code
+│   │
+│   ├── decision_engine/                # Real-time processing and pipeline brain
+│   │   ├── Checkpoints/                # Spark structured streaming checkpoint metadata
+│   │   ├── dispatch_engine.py          # Core Spark stream (mapInPandas & routing logic)
+│   │   ├── hospitals_cdc_to_olap.py    # CDC ingestion pipeline handling hospital updates
+│   │   ├── Dockerfile                  # Container definition for the Spark cluster worker
+│   │   └── requirements.txt            # Python dependencies for the core engine
+│   │
+│   └── simulators/                     # Simulation cluster for real-time data streaming
+│       │
+│       ├── hospitals/                  # ICU bed drift and state changes simulator
+│       │   ├── data/                   # Hospital location seed data
+│       │   ├── cdc_config.sql          # SQL scripts setting up transactional logging/CDC
+│       │   ├── icu_sim.py              # Generator triggering dynamic hospital bed drift
+│       │   ├── Dockerfile              
+│       │   └── requirements.txt        
+│       │
+│       ├── incident/                   # Emergency events generator
+│       │   ├── accidents.csv           # Historical spatial accident database
+│       │   ├── incident_simulator.py   # High-velocity producer streaming incidents to Redpanda
+│       │   ├── Dockerfile               
+│       │   └── requirements.txt        
+│       │
+│       └── traffic/                    # Dynamic routing map engine
+│           ├── fetch_and_build.py      # Automates OpenStreetMap ingestion and graph compilation
+│           └── Dockerfile.traffic      
 │
-├── /
-│   └── openmetadata/
-│       └── metadata_ingestion.yaml
-│
-├── docker/
-│   ├── docker-compose.yml           # Full local stack
-│   └── services/
-│       ├── clickhouse/
-│       ├── kafka/
-│       ├── airflow/
-│       └── grafana/
-│
-└── README.md
+├── .gitignore                          
+├── docker-compose.yml                  
+└── README.md                           
 ```
-
 
 ## Getting Started
 
-### Prerequisites
+1. Clone the repository:
+    ```bash
+    git clone medroute-intelligence-platform.git
+    cd medroute-intelligence-platform 
+    ```
 
-- Docker and Docker Compose
-- Python 3.11+
-- dbt-clickhouse adapter
+2. You need to down load the OpenStreetMap PBF file for your region of interest then set up Valhall engine to build the routing graph. 
 
-### Run the full stack locally
+3. Upload the HIFLD hospital registry and OpenStreetMap road network data into Postgres (I used QGIS tool as a shortcut).
 
-```bash
-# Clone the repository
-git clone https://github.com/your-username/medroute-intelligence-platform.git
-cd medroute-intelligence-platform
+4. Start the platform using Docker Compose:
+    ```bash
+    docker compose up -d
+    ```
 
-# Start all services
-docker compose up -d
+5. Open the Control Center
 
-# Verify services are running
-docker compose ps
-```
+    Navigate to `http://localhost:3000` to access the Grafana Route Analytics board (Default: `admin / admin`).
 
-Services started:
-
-| Service | Port |
-|---|---|
-| ClickHouse | 8123 (HTTP), 9000 (native) |
-| Kafka | 9092 |
-| Airflow UI | 8080 |
-| Grafana | 3000 |
-| OpenMetadata | 8585 |
-
-### Run batch ingestion
-
-```bash
-cd ingestion/batch
-pip install -r requirements.txt
-python cms_provider.py
-python hifld_open.py
-python openstreetmap.py
-```
-
-### Start streaming simulators
-
-```bash
-cd ingestion/streaming
-python incident_simulator.py &
-python gps_simulator.py &
-python kafka_consumer.py
-```
-
-### Run dbt transformations
-
-```bash
-cd transformation/dbt_project
-pip install dbt-clickhouse
-dbt deps
-dbt run
-dbt test
-dbt docs generate && dbt docs serve
-```
-
-### Start the decision engine
-
-```bash
-cd decision_engine
-python dispatch_api.py
-# In a separate terminal:
-spark-submit spark_scoring.py
-```
-
-### Start hospitals CDC to OLAP sync
-
-```bash
-docker compose up -d hospitals-olap-sync-engine
-```
-
-This Spark stream consumes Debezium CDC events from `medroute.public.hospitals`
-and keeps `hospitals_olap` in PostgreSQL synchronized via upsert/delete logic.
-
-### Open dashboards
-
-Navigate to `http://localhost:3000` in your browser. Default credentials: `admin / admin`.
-
----
-
-## Orchestration
-
-Apache Airflow manages all scheduled pipeline runs.
-
-| DAG | Schedule | What it does |
-|---|---|---|
-| `batch_ingestion_dag` | Daily at 06:00 UTC | Runs all batch ingestion scripts in dependency order |
-| `dbt_transformation_dag` | Daily at 07:00 UTC | Runs dbt models bronze → silver → gold, then runs all tests |
-
-Access the Airflow UI at `http://localhost:8080`.
-
-The streaming pipeline (Kafka producers, consumers, and Spark scoring) runs continuously and is not managed by Airflow — it is always-on.
-
----
-
-## Governance & Catalog
-
-OpenMetadata provides a central catalog for all datasets in the platform.
-
-- Every ClickHouse table is registered with its owner, description, and update frequency
-- dbt lineage is imported automatically — every gold table shows its full lineage back to the raw source
-- Data quality scores from dbt tests are surfaced per table
-- PII fields are tagged and tracked (patient data, location data)
-
-Access OpenMetadata at `http://localhost:8585`.
+## Improvements & Future Work
+- Use **live traffic** data from Google Maps or HERE API to improve routing accuracy.
+- **Injury type classification**: add a ML classifier that reads incident description and tags it (cardiac, trauma, stroke) to match hospital specialties better
 
 
-## Deployment
-
-All services are containerised with Docker. Each service has its own Dockerfile and is orchestrated locally via Docker Compose.
-
-For production deployment, each service maps to a managed equivalent:
-
-| Local (Docker) | Production equivalent |
-|---|---|
-| ClickHouse container | ClickHouse Cloud or self-hosted cluster |
-| Kafka container | Confluent Cloud or AWS MSK |
-| Airflow container | MWAA (AWS) or Cloud Composer (GCP) |
-| Spark (local mode) | EMR, Dataproc, or Spark on Kubernetes |
-| Grafana container | Grafana Cloud |
-
-Infrastructure is defined as code — all Docker Compose files, environment configs, and service definitions are version-controlled and reproducible.
+**Built with ❤️ by Ali Adel**
